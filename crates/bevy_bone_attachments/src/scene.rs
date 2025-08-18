@@ -10,7 +10,7 @@ use bevy_ecs::{
     relationship::RelatedSpawnerCommands,
     system::{Commands, EntityCommands, Query},
 };
-use bevy_platform_support::collections::{hash_map::Entry, HashMap};
+use bevy_platform::collections::{hash_map::Entry, HashMap};
 use bevy_scene::{Scene, SceneInstanceReady, SceneRoot};
 
 use crate::prelude::AttachedTo;
@@ -37,7 +37,7 @@ impl<'a> SceneAttachmentExt for EntityCommands<'a> {
         scene: Handle<Scene>,
         extras: impl Bundle,
     ) -> &mut EntityCommands<'a> {
-        self.with_related(|spawner: &mut RelatedSpawnerCommands<AttachedTo>| {
+        self.with_related_entities(|spawner: &mut RelatedSpawnerCommands<AttachedTo>| {
             spawner
                 .spawn((SceneRoot(scene), extras))
                 .observe(scene_attachment_ready);
