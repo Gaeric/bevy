@@ -56,8 +56,6 @@ plugin_group! {
         bevy_gilrs:::GilrsPlugin,
         #[cfg(feature = "bevy_animation")]
         bevy_animation:::AnimationPlugin,
-        #[cfg(feature = "bevy_bone_attachments")]
-        bevy_bone_attachments:::BoneAttachmentsPlugin,
         #[cfg(feature = "bevy_gizmos")]
         bevy_gizmos:::GizmoPlugin,
         #[cfg(feature = "bevy_state")]
