@@ -7,6 +7,7 @@
 
 use bevy_app::Plugin;
 use contrast_adaptive_sharpening::CasPlugin;
+use fsr3::Fsr3Plugin;
 use fxaa::FxaaPlugin;
 use smaa::SmaaPlugin;
 use taa::TemporalAntiAliasPlugin;
@@ -14,6 +15,7 @@ use taa::TemporalAntiAliasPlugin;
 pub mod contrast_adaptive_sharpening;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 pub mod dlss;
+pub mod fsr3;
 pub mod fxaa;
 pub mod smaa;
 pub mod taa;
@@ -29,6 +31,7 @@ impl Plugin for AntiAliasPlugin {
             SmaaPlugin,
             TemporalAntiAliasPlugin,
             CasPlugin,
+            Fsr3Plugin,
             #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
             dlss::DlssPlugin,
         ));
