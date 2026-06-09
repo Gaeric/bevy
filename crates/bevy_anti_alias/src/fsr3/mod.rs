@@ -62,6 +62,7 @@ use bevy_render::{
     ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
 };
 use std::{mem::size_of, sync::Mutex};
+use tracing::info;
 use wgpu_ffx::{FsrContext, FsrContextFlags, FsrContextInfo};
 
 /// Plugin for AMD FidelityFX Super Resolution 3.
@@ -87,7 +88,6 @@ impl Plugin for Fsr3Plugin {
                     prepare_fsr3_textures.in_set(RenderSystems::PrepareResources),
                 ),
             );
-
 
         render_app.add_systems(
             Core3d,
@@ -212,6 +212,7 @@ impl Fsr3QualityMode {
 struct Fsr3RenderContext {
     context: Mutex<FsrContext>,
     quality_mode: Fsr3QualityMode,
+    max_render_size: [u32; 2],
     max_upscale_size: [u32; 2],
 }
 
@@ -334,6 +335,9 @@ fn prepare_fsr3_jitter_and_context(
                 flags |= FsrContextFlags::DEPTH_INFINITE;
             }
 
+            info!("max_render_size: {max_render_size:?}, max_upscale_size: {upscale_resolution:?}");
+            info!("fsr flags: {flags:?}");
+
             // Create FSR3 context
             let context_info = FsrContextInfo {
                 device: render_device.wgpu_device().clone(),
@@ -349,6 +353,7 @@ fn prepare_fsr3_jitter_and_context(
                 Fsr3RenderContext {
                     context: Mutex::new(context),
                     quality_mode: fsr3.quality_mode,
+                    max_render_size: [max_render_size.x, max_render_size.y],
                     max_upscale_size: [upscale_resolution.x, upscale_resolution.y],
                 },
                 MainPassResolutionOverride(render_resolution),

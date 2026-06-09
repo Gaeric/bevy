@@ -1,6 +1,6 @@
 use bevy_camera::MainPassResolutionOverride;
 use bevy_core_pipeline::prepass::ViewPrepassTextures;
-use bevy_ecs::system::{Commands, Query, Res, ResMut};
+use bevy_ecs::system::{Res, ResMut};
 use bevy_math::Vec4Swizzles;
 use bevy_render::{
     camera::{ExtractedCamera, TemporalJitter},
@@ -83,7 +83,10 @@ pub fn fsr_super_resolution(
     // Bevy's motion vectors are in render resolution, FSR3 expects them in pixels
     let motion_vector_scale = [-(render_size.x as f32), -(render_size.y as f32)];
 
-    let mut context = fsr3_context.context.lock().unwrap();
+    let max_render_size = fsr3_context.max_render_size;
+    let max_upscale_size = fsr3_context.max_upscale_size;
+
+    let context = fsr3_context.context.lock().unwrap();
 
     // Create a command encoder specifically for FSR3
     let encoder = render_context.command_encoder();
@@ -118,9 +121,10 @@ pub fn fsr_super_resolution(
         flags: FsrDispatchFlags::empty(),
     };
 
-    let mut view = context.create_view(&render_queue, [1920, 1080], [3840, 2160]);
+    let mut view = context.create_view(&render_queue, max_render_size, max_upscale_size);
 
-    println!("FSR3BB");
+    println!("render_size: {render_size:?}, upscale_size: {max_upscale_size:?}");
+    println!("FSR3BB, max_render_size: {max_render_size:?}, max_upscale_size: {max_upscale_size:?}");
 
     // Execute FSR3
     context
