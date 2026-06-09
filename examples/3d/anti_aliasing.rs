@@ -5,7 +5,7 @@ use std::{f32::consts::PI, fmt::Write};
 use bevy::{
     anti_alias::{
         contrast_adaptive_sharpening::ContrastAdaptiveSharpening,
-        fsr3::Fsr3,
+        fsr3::{Fsr3, Fsr3QualityMode},
         fxaa::{Fxaa, Sensitivity},
         smaa::{Smaa, SmaaPreset},
         taa::TemporalAntiAliasing,
@@ -91,7 +91,7 @@ fn modify_aa(
             Option<&mut Fxaa>,
             Option<&mut Smaa>,
             Option<&TemporalAntiAliasing>,
-            Option<&Fsr3>,
+            Option<&mut Fsr3>,
             &mut Msaa,
         ),
         With<Camera>,
@@ -225,6 +225,25 @@ fn modify_aa(
             .remove::<TaaComponents>()
             .remove::<DlssComponents>()
             .insert(Fsr3::default());
+    }
+
+    // Fsr3 Settings
+    if let Some(mut fsr3) = fsr3 {
+        if keys.just_pressed(KeyCode::KeyQ) {
+            fsr3.quality_mode = Fsr3QualityMode::NativeAA
+        }
+        if keys.just_pressed(KeyCode::KeyW) {
+            fsr3.quality_mode = Fsr3QualityMode::Quality
+        }
+        if keys.just_pressed(KeyCode::KeyE) {
+            fsr3.quality_mode = Fsr3QualityMode::Balanced
+        }
+        if keys.just_pressed(KeyCode::KeyR) {
+            fsr3.quality_mode = Fsr3QualityMode::Performance
+        }
+        if keys.just_pressed(KeyCode::KeyT) {
+            fsr3.quality_mode = Fsr3QualityMode::UltraPerformance
+        }
     }
 
     // DLSS
@@ -400,6 +419,40 @@ fn update_ui(
         draw_selectable_menu_item(ui, "Medium", 'W', smaa.preset == SmaaPreset::Medium);
         draw_selectable_menu_item(ui, "High", 'E', smaa.preset == SmaaPreset::High);
         draw_selectable_menu_item(ui, "Ultra", 'R', smaa.preset == SmaaPreset::Ultra);
+    }
+
+    if let Some(fsr3) = fsr3 {
+        ui.push_str("\n----------\n\nQuality\n");
+        draw_selectable_menu_item(
+            ui,
+            "NativeAA",
+            'Q',
+            fsr3.quality_mode == Fsr3QualityMode::NativeAA,
+        );
+        draw_selectable_menu_item(
+            ui,
+            "Quality",
+            'W',
+            fsr3.quality_mode == Fsr3QualityMode::Quality,
+        );
+        draw_selectable_menu_item(
+            ui,
+            "Balanced",
+            'E',
+            fsr3.quality_mode == Fsr3QualityMode::Balanced,
+        );
+        draw_selectable_menu_item(
+            ui,
+            "Performance",
+            'R',
+            fsr3.quality_mode == Fsr3QualityMode::Performance,
+        );
+        draw_selectable_menu_item(
+            ui,
+            "Ultra",
+            'T',
+            fsr3.quality_mode == Fsr3QualityMode::UltraPerformance,
+        );
     }
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
