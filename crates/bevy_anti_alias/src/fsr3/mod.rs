@@ -302,6 +302,8 @@ fn prepare_fsr3_jitter_and_context(
         );
         let jitter = wgpu_ffx::get_jitter_offset(frame_count.0 as i32, phase_count);
         temporal_jitter.offset = Vec2::from(jitter);
+        // temporal_jitter.offset = Vec2::new(0.9, 0.9);
+        info!("temporal_jitter is {:?}", temporal_jitter.offset);
 
         // Calculate mip bias
         let scale_factor = fsr3.quality_mode.scale_factor();
@@ -335,8 +337,7 @@ fn prepare_fsr3_jitter_and_context(
                 flags |= FsrContextFlags::DEPTH_INFINITE;
             }
 
-            info!("max_render_size: {max_render_size:?}, max_upscale_size: {upscale_resolution:?}");
-            info!("fsr flags: {flags:?}");
+            info!("max_render_size: {max_render_size:?}, max_upscale_size: {upscale_resolution:?}, fsr flags: {flags:?}");
 
             // Create FSR3 context
             let context_info = FsrContextInfo {

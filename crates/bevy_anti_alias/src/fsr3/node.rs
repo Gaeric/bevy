@@ -1,14 +1,14 @@
 use bevy_camera::MainPassResolutionOverride;
 use bevy_core_pipeline::prepass::ViewPrepassTextures;
 use bevy_ecs::system::{Res, ResMut};
-use bevy_math::Vec4Swizzles;
+use bevy_math::{Vec2, Vec4Swizzles};
 use bevy_render::{
     camera::{ExtractedCamera, TemporalJitter},
     renderer::{RenderContext, RenderQueue, ViewQuery},
     view::{ExtractedView, Msaa, ViewTarget},
 };
 use bevy_time::Time;
-use tracing::warn;
+use tracing::{info, warn};
 use wgpu_ffx::{FsrDispatchFlags, FsrDispatchInfo};
 
 use crate::fsr3::{Fsr3, Fsr3RenderContext, Fsr3Textures};
@@ -87,6 +87,8 @@ pub fn fsr_super_resolution(
     let max_upscale_size = fsr3_context.max_upscale_size;
 
     let context = fsr3_context.context.lock().unwrap();
+    let jitter = temporal_jitter.offset;
+    // let jitter: Vec2 = [0.9, 0.9].into();
 
     // Create a command encoder specifically for FSR3
     let encoder = render_context.command_encoder();
@@ -104,7 +106,7 @@ pub fn fsr_super_resolution(
         output: wgpu::Texture::clone(&view_target.destination_texture),
         render_size: [render_size.x, render_size.y],
         upscale_size: [upscale_size.x, upscale_size.y],
-        jitter_offset: [temporal_jitter.offset.x, temporal_jitter.offset.y],
+        jitter_offset: [jitter.x, jitter.y],
         motion_vector_scale,
         camera_fov_y,
         camera_near,
@@ -123,8 +125,7 @@ pub fn fsr_super_resolution(
 
     let mut view = context.create_view(&render_queue, max_render_size, max_upscale_size);
 
-    println!("render_size: {render_size:?}, upscale_size: {max_upscale_size:?}");
-    println!("FSR3BB, max_render_size: {max_render_size:?}, max_upscale_size: {max_upscale_size:?}");
+    info!("FSR3BB, max_render_size: {max_render_size:?}, max_upscale_size: {max_upscale_size:?}, render_size: {render_size:?}, upscale_size: {max_upscale_size:?}, jitter_offset: {:?}", temporal_jitter.offset);
 
     // Execute FSR3
     context
