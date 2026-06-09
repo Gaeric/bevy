@@ -302,7 +302,6 @@ fn prepare_fsr3_jitter_and_context(
         );
         let jitter = wgpu_ffx::get_jitter_offset(frame_count.0 as i32, phase_count);
         temporal_jitter.offset = Vec2::from(jitter);
-        // temporal_jitter.offset = Vec2::new(0.9, 0.9);
         info!("temporal_jitter is {:?}", temporal_jitter.offset);
 
         // Calculate mip bias

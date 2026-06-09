@@ -87,8 +87,6 @@ pub fn fsr_super_resolution(
     let max_upscale_size = fsr3_context.max_upscale_size;
 
     let context = fsr3_context.context.lock().unwrap();
-    let jitter = temporal_jitter.offset;
-    // let jitter: Vec2 = [0.9, 0.9].into();
 
     // Create a command encoder specifically for FSR3
     let encoder = render_context.command_encoder();
@@ -106,7 +104,7 @@ pub fn fsr_super_resolution(
         output: wgpu::Texture::clone(&view_target.destination_texture),
         render_size: [render_size.x, render_size.y],
         upscale_size: [upscale_size.x, upscale_size.y],
-        jitter_offset: [jitter.x, jitter.y],
+        jitter_offset: [-temporal_jitter.offset.x, - temporal_jitter.offset.y],
         motion_vector_scale,
         camera_fov_y,
         camera_near,
