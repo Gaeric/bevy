@@ -13,22 +13,19 @@ use bevy_ecs::{
     entity::Entity,
     system::{Commands, Query, Res},
 };
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_image::ToExtents;
 use bevy_math::UVec2;
 use bevy_render::{
     camera::ExtractedCamera,
-    render_resource::{Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages},
-    renderer::{RenderDevice, RenderQueue},
-};
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-use bevy_render::{
     render_resource::{
-        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+        Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages, TextureDescriptor,
+        TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
     },
+    renderer::{RenderDevice, RenderQueue},
     texture::CachedTexture,
 };
 use bytemuck::{Pod, Zeroable};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Size of the `LightSample` shader struct in bytes.
 const LIGHT_SAMPLE_STRUCT_SIZE: u64 = 8;
@@ -76,11 +73,17 @@ struct SolariLightingUniforms {
     frame_rng: u32,
     reset: u32,
     shadow_terminator_fix: u32,
-    _padding: [u32; 3],
+    shadow_terminator_history_valid: u32,
+    _padding: [u32; 2],
 }
 
 impl SolariLightingUniforms {
-    fn new(settings: &SolariLighting, frame_count: u32, force_reset: bool) -> Self {
+    fn new(
+        settings: &SolariLighting,
+        frame_count: u32,
+        force_reset: bool,
+        shadow_terminator_history_valid: bool,
+    ) -> Self {
         Self {
             confidence_weight_cap: settings.confidence_weight_cap,
             primary_di_samples: settings.primary_di_samples,
@@ -95,7 +98,8 @@ impl SolariLightingUniforms {
             frame_rng: frame_count.wrapping_mul(5782582),
             reset: (settings.reset || force_reset) as u32,
             shadow_terminator_fix: settings.shadow_terminator_fix as u32,
-            _padding: [0; 3],
+            shadow_terminator_history_valid: shadow_terminator_history_valid as u32,
+            _padding: [0; 2],
         }
     }
 }
@@ -125,6 +129,71 @@ pub struct SolariLightingResources {
     pub world_cache_active_cells_dispatch: Buffer,
     pub view_size: UVec2,
     pub shadow_terminator_fix: bool,
+    pub shadow_terminator_offsets: ShadowTerminatorTextures,
+}
+
+/// Fixed current/previous offset textures, owned by this view rather than the texture cache.
+/// After successful lighting, copy current into previous and record the rendered frame.
+pub struct ShadowTerminatorTextures {
+    pub current: CachedTexture,
+    pub previous: CachedTexture,
+    pub last_rendered_frame: AtomicU32,
+}
+
+impl ShadowTerminatorTextures {
+    fn new(render_device: &RenderDevice, view_size: UVec2, enabled: bool) -> Self {
+        // The enabled pair costs 32 bytes per pixel; disabled views retain only two
+        // bind-compatible 1x1 placeholders, never full-resolution offset textures.
+        let size = if enabled { view_size } else { UVec2::ONE }.to_extents();
+        let texture = |label, usage| {
+            let texture = render_device.create_texture(&TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba32Float,
+                usage,
+                view_formats: &[],
+            });
+            let default_view = texture.create_view(&TextureViewDescriptor::default());
+            CachedTexture {
+                texture,
+                default_view,
+            }
+        };
+        Self {
+            current: texture(
+                "solari_lighting_shadow_terminator_offsets_current",
+                TextureUsages::STORAGE_BINDING
+                    | TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::COPY_SRC,
+            ),
+            previous: texture(
+                "solari_lighting_shadow_terminator_offsets_previous",
+                TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            ),
+            last_rendered_frame: AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
+/// History is usable only when this exact resource set was rendered last frame.
+fn shadow_terminator_history_valid(
+    enabled: bool,
+    reset: bool,
+    mode_changed: bool,
+    resources_reusable: bool,
+    last_rendered_frame: u32,
+    frame_count: u32,
+) -> bool {
+    enabled
+        && !reset
+        && !mode_changed
+        && resources_reusable
+        // Frame zero must not mistake the invalid sentinel for the preceding frame.
+        && frame_count != 0
+        && last_rendered_frame == frame_count.wrapping_sub(1)
 }
 
 pub struct SolariReservoirBuffers {
@@ -174,17 +243,46 @@ pub fn prepare_solari_lighting_resources(
             view_size = *resolution_override;
         }
 
-        let reusable = solari_lighting_resources.filter(|r| {
+        let mut reusable = solari_lighting_resources.filter(|r| {
             r.view_size == view_size && r.reservoirs.is_some() == solari_lighting.restir
         });
         let mode_changed = reusable
             .as_ref()
             .is_some_and(|r| r.shadow_terminator_fix != solari_lighting.shadow_terminator_fix);
-        let uniforms = SolariLightingUniforms::new(
-            solari_lighting,
+        let force_reset = reusable.is_none() || mode_changed;
+        if let Some(resources) = reusable.as_mut() {
+            if mode_changed {
+                // Keep the world cache, reservoirs, and light tiles across toggles.
+                // Replacing these owned handles releases the old offset allocation.
+                resources.shadow_terminator_offsets = ShadowTerminatorTextures::new(
+                    &render_device,
+                    view_size,
+                    solari_lighting.shadow_terminator_fix,
+                );
+            }
+            if solari_lighting.reset || force_reset {
+                // Invalidate before uploading uniforms, even if lighting is skipped.
+                resources
+                    .shadow_terminator_offsets
+                    .last_rendered_frame
+                    .store(u32::MAX, Ordering::Relaxed);
+            }
+        }
+        let history_valid = shadow_terminator_history_valid(
+            solari_lighting.shadow_terminator_fix,
+            solari_lighting.reset || force_reset,
+            mode_changed,
+            reusable.is_some(),
+            reusable.as_ref().map_or(u32::MAX, |resources| {
+                resources
+                    .shadow_terminator_offsets
+                    .last_rendered_frame
+                    .load(Ordering::Relaxed)
+            }),
             frame_count.0,
-            reusable.is_none() || mode_changed,
         );
+        let uniforms =
+            SolariLightingUniforms::new(solari_lighting, frame_count.0, force_reset, history_valid);
 
         if let Some(mut solari_lighting_resources) = reusable {
             solari_lighting_resources.shadow_terminator_fix = solari_lighting.shadow_terminator_fix;
@@ -257,6 +355,11 @@ pub fn prepare_solari_lighting_resources(
             world_cache_active_cells_dispatch,
             view_size,
             shadow_terminator_fix: solari_lighting.shadow_terminator_fix,
+            shadow_terminator_offsets: ShadowTerminatorTextures::new(
+                &render_device,
+                view_size,
+                solari_lighting.shadow_terminator_fix,
+            ),
         });
 
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -364,15 +467,77 @@ mod tests {
             core::mem::offset_of!(SolariLightingUniforms, shadow_terminator_fix),
             48
         );
+        assert_eq!(
+            core::mem::offset_of!(SolariLightingUniforms, shadow_terminator_history_valid),
+            52
+        );
         let mut settings = SolariLighting::default();
         settings.reset = false;
-        let uniforms = SolariLightingUniforms::new(&settings, 0, false);
+        let uniforms = SolariLightingUniforms::new(&settings, 0, false, false);
         assert_eq!(uniforms.shadow_terminator_fix, 0);
         assert_eq!(uniforms.reset, 0);
         settings.shadow_terminator_fix = true;
-        let uniforms = SolariLightingUniforms::new(&settings, 0, true);
+        let uniforms = SolariLightingUniforms::new(&settings, 0, true, false);
         assert_eq!(uniforms.shadow_terminator_fix, 1);
         assert_eq!(uniforms.reset, 1);
-        assert_eq!(uniforms._padding, [0; 3]);
+        assert_eq!(uniforms.shadow_terminator_history_valid, 0);
+        assert_eq!(uniforms._padding, [0; 2]);
+        let uniforms = SolariLightingUniforms::new(&settings, 1, false, true);
+        assert_eq!(uniforms.shadow_terminator_history_valid, 1);
+        assert_eq!(uniforms.reset, 0);
+    }
+
+    #[test]
+    fn shadow_terminator_history_requires_consecutive_successful_frames() {
+        let valid =
+            |last, frame| shadow_terminator_history_valid(true, false, false, true, last, frame);
+        assert!(valid(0, 1));
+        assert!(valid(41, 42));
+        assert!(valid(u32::MAX - 1, u32::MAX));
+        assert!(!valid(u32::MAX, 0)); // Initial sentinel and frame-count wrap.
+        assert!(!valid(u32::MAX, 1)); // New or invalidated textures.
+        assert!(!valid(40, 42)); // A skipped lighting frame.
+        assert!(!valid(42, 42)); // Already rendered this frame, not last frame.
+    }
+
+    #[test]
+    fn shadow_terminator_history_rejects_reset_toggle_and_reallocation() {
+        assert!(shadow_terminator_history_valid(
+            true, false, false, true, 6, 7
+        ));
+        assert!(!shadow_terminator_history_valid(
+            false, false, false, true, 6, 7
+        ));
+        assert!(!shadow_terminator_history_valid(
+            true, true, false, true, 6, 7
+        ));
+        assert!(!shadow_terminator_history_valid(
+            true, false, true, true, 6, 7
+        ));
+        // A resize or ReSTIR mode change creates a new resource set.
+        assert!(!shadow_terminator_history_valid(
+            true, false, false, false, 6, 7
+        ));
+        // Reset invalidates the stamp even when that frame never renders.
+        let last_rendered_frame = AtomicU32::new(6);
+        last_rendered_frame.store(u32::MAX, Ordering::Relaxed);
+        assert!(!shadow_terminator_history_valid(
+            true,
+            false,
+            false,
+            true,
+            last_rendered_frame.load(Ordering::Relaxed),
+            7,
+        ));
+        // A successful render after a toggle/reset seeds the next frame's history.
+        last_rendered_frame.store(7, Ordering::Relaxed);
+        assert!(shadow_terminator_history_valid(
+            true,
+            false,
+            false,
+            true,
+            last_rendered_frame.load(Ordering::Relaxed),
+            8,
+        ));
     }
 }

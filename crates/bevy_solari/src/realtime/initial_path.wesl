@@ -1,11 +1,10 @@
-import package::realtime::shadow_terminator::primary_shadow_terminator_offset;
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_range_u};
 import bevy_render::maths::PI;
 import bevy_render::utils::octahedral_encode;
 import package::scene::brdf::{brdf_pdf, evaluate_and_sample_brdf, evaluate_brdf, EvaluateAndSampleBrdfResult, F_AB};
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
-import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, Reservoir, constants, view};
+import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, Reservoir, constants, view, load_shadow_terminator_offset};
 import package::scene::sampling::{calculate_resolved_light_contribution, isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility, sample_environment_map_light};
 import package::scene::bindings::{light_sources, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray};
 import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
@@ -59,7 +58,7 @@ struct PathState {
 fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial) -> PathState {
     var path: PathState;
     path.ray_origin = world_position + (world_normal * RAY_T_MIN);
-    path.shadow_ray_origin = path.ray_origin + primary_shadow_terminator_offset(world_position, view.world_position);
+    path.shadow_ray_origin = path.ray_origin;
     path.normal = world_normal;
     path.wo = wo;
     path.material = material;
@@ -84,6 +83,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
     let primary_F_ab = F_AB(material.perceptual_roughness, primary_NdotV);
 
     var path = new_path_state(world_position, world_normal, wo, material);
+    path.shadow_ray_origin += load_shadow_terminator_offset(pixel_id);
 
     @if(DLSS_RR_GUIDE_BUFFERS)
     var psr = psr_init(world_normal, material);

@@ -25,6 +25,10 @@ enable wgpu_ray_query;
 @group(1) @binding(13) var<storage, read_write> reservoirs_b: array<Reservoir>;
 }
 
+// Kept separate from the G-buffer: world-space xyz offset + match-validity in w.
+@group(1) @binding(14) var shadow_terminator_offsets: texture_2d<f32>;
+@group(1) @binding(15) var previous_shadow_terminator_offsets: texture_2d<f32>;
+
 @if(DLSS_RR_GUIDE_BUFFERS) {
 @group(2) @binding(0) var diffuse_albedo: texture_storage_2d<rgba8unorm, write>;
 @group(2) @binding(1) var specular_albedo: texture_storage_2d<rgba8unorm, write>;
@@ -38,6 +42,20 @@ fn load_motion_vector(pixel_id: vec2<u32>) -> vec2<f32> {
     return textureLoad(motion_vectors, pixel_id).xy;
     @if(!MOTION_VECTORS_READ_WRITE)
     return textureLoad(motion_vectors, pixel_id, 0).xy;
+}
+
+// Disabled views bind 1x1 placeholders. Always branch before touching the textures.
+fn load_shadow_terminator_offset(pixel_id: vec2<u32>) -> vec3<f32> {
+    if constants.shadow_terminator_fix == 0u { return vec3(0.0); }
+    let value = textureLoad(shadow_terminator_offsets, pixel_id, 0);
+    return select(vec3(0.0), value.xyz, value.w > 0.0);
+}
+
+@if(RESTIR)
+fn load_previous_shadow_terminator_offset(pixel_id: vec2<u32>) -> vec3<f32> {
+    if constants.shadow_terminator_fix == 0u || constants.shadow_terminator_history_valid == 0u { return vec3(0.0); }
+    let value = textureLoad(previous_shadow_terminator_offsets, pixel_id, 0);
+    return select(vec3(0.0), value.xyz, value.w > 0.0);
 }
 
 /// User-configurable settings from the `SolariLighting` component, plus per-frame
@@ -56,9 +74,9 @@ struct SolariLightingSettings {
     frame_rng: u32,
     reset: u32,
     shadow_terminator_fix: u32,
+    shadow_terminator_history_valid: u32,
     _padding_a: u32,
     _padding_b: u32,
-    _padding_c: u32,
 }
 
 /// Don't adjust the size of this struct without also adjusting `prepare::RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE`.

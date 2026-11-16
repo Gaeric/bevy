@@ -66,25 +66,64 @@ camera setting automatically resets its Solari history without reallocating the
 world cache or recompiling shaders. Default behavior is unchanged: the global
 override is `None`, and each camera's correction is `false`.
 
+### Implementation: dedicated offset textures (scheme 3)
+
+```text
+existing raster depth/G-buffer (unchanged)
+    -> offset generation compute pass
+       one recovery ray per visible pixel + Gems II vertex-plane projection
+    -> current offset texture: xyz = world-space displacement, w = match validity
+    -> primary directional-light visibility + ReSTIR spatial/temporal visibility
+    -> copy current offsets to the previous-offset texture after lighting
+```
+
+The producer and consumer are separate. The current producer is a dedicated Solari
+compute pass, **not** a modification to Bevy's general raster prepass. It still uses
+an additional primary ray to recover triangle information; scheme 3 does not by
+itself eliminate that cost. Unlike the previous inline experiment, recovery is
+performed only once per visible pixel and reused by all lighting/reuse queries.
+A future raster or visibility-buffer producer can populate the same displacement
+texture without changing those consumers.
+
+ReSTIR temporal reuse is now supported while the correction is enabled: previous
+pixel offsets are sampled at the same reprojected/permuted coordinate as previous
+depth, G-buffer, and reservoirs. Reverse temporal visibility uses the stored offset
+with the previous TLAS, without indexing current mesh data using an old instance ID.
+Offsets are overwritten for every current pixel, including zero/invalid values for
+background and mismatches. First frames, camera resets, toggles, resolution changes,
+and skipped lighting frames invalidate history until a matching frame is available.
+
+Dynamic switching remains a runtime uniform/resource choice, not a shader variant:
+
+- **Enabled:** allocate current and previous `RGBA32Float` textures at the camera's
+  internal rendering resolution. Generate offsets before lighting and copy history
+  after all lighting reads. This costs 32 bytes per pixel for the pair (about
+  **63.3 MiB at 1920x1080**, **253.1 MiB at 3840x2160**, per enabled camera), plus
+  per-frame generation, sampling, and copy bandwidth.
+- **Disabled:** skip generation and history copies and use zero displacement.
+  Full-size textures are released and only two 1x1 binding placeholders remain.
+- **Toggle:** replace only the offset textures and invalidate lighting history;
+  existing world-cache, light-tile, and reservoir buffers are not reallocated.
+- GPU diagnostics expose `solari_lighting/shadow_terminator_offsets` separately
+  from lighting, so the producer's cost can be measured in the existing scene.
+
 ### Prototype scope
 
-This is a deliberately limited, unoptimized validation of Johannes Hanika's
+This is a limited implementation of Johannes Hanika's
 [Ray Tracing Gems II, chapter 4](https://jo.dreggn.org/home/2021_terminator.pdf):
 
-- An extra camera ray recovers the first visible triangle and barycentric
-  coordinates. Vertex tangent-plane projections determine a shadow-origin offset.
 - Only **primary directional-light NEE shadow rays** use the offset. A scene lit
   exclusively by emissive area lights will not show a corrected terminator.
   Original shading positions, BRDFs, area-light shadows, indirect rays, and
   world-cache sampling are unchanged. This avoids mixing modified area-light
   visibility with an unmodified BRDF-emissive MIS strategy.
-- Perspective cameras only. Missing/mismatched ray hits or invalid normals fall
-  back to the original origin. Position matching uses a heuristic tolerance, not
-  a guaranteed raster/ray geometry identity check.
-- When enabled, ReSTIR spatial visibility uses the same correction, but temporal
-  reuse is disabled: the previous TLAS alone cannot safely recover previous mesh
-  data after instance slots or geometry have changed. Spatial reuse can add more
-  recovery rays. Compare with ReSTIR off before judging performance or noise.
+- Recovery starts at each pixel's reconstructed near-plane position, using the
+  same inverse projection as depth reconstruction, including for orthographic
+  projections. This does not change Solari's existing BRDF/view-direction logic.
+- Missing/mismatched ray hits or invalid normals fall back to zero offset.
+  Position matching uses a heuristic tolerance, not a guaranteed raster/ray
+  geometry identity check. Nearly coincident surfaces, alpha-clipped geometry,
+  and raster/ray deformation differences need particular care.
 - Does not fix normal-map bump terminators, low-poly silhouettes, or all indirect
   terminators. Watch for light leaks, detached contact shadows, and hard-edge
   discontinuities. The reference pathtracer is unchanged. This is not a

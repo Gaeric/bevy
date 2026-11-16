@@ -53,7 +53,7 @@ impl Plugin for SolariLightingPlugin {
             .register_type::<SolariLighting>();
 
         load_shader_library!(app, "gbuffer_utils.wesl");
-        load_shader_library!(app, "shadow_terminator.wesl");
+        embedded_asset!(app, "shadow_terminator.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "presample_light_tiles.wesl");
         load_shader_library!(app, "initial_path.wesl");
@@ -126,7 +126,7 @@ pub struct SolariLightingSettings {
     /// This override is applied during extraction without modifying camera components.
     /// Changes take effect on the next extracted frame and reset affected cameras'
     /// Solari temporal history automatically. See [`SolariLighting::shadow_terminator_fix`]
-    /// for the prototype's directional-light, perspective-camera, and ReSTIR limitations.
+    /// for the prototype's directional-light scope, cost, and limitations.
     pub shadow_terminator_fix: Option<bool>,
 }
 
@@ -167,15 +167,21 @@ pub struct SolariLighting {
     /// Per-camera setting. [`SolariLightingSettings::shadow_terminator_fix`] can override
     /// it globally at runtime; `None` on the resource leaves this camera setting in control.
     ///
-    /// Recovers the primary triangle with an additional camera ray and uses its vertex
-    /// tangent planes to offset primary directional-light shadow rays. Perspective cameras
-    /// only; orthographic views fall back to the original origin. Does not change area-light
-    /// shadows, the G-buffer, BRDF, indirect rays, or world cache. Normal-map terminators
-    /// are not fixed. Raster/raytracing hit mismatches fall back to the original origin.
-    /// While enabled, ReSTIR retains spatial reuse but disables temporal reuse, since previous
-    /// triangle data is not retained. Spatial reuse may perform extra recovery rays.
-    /// This is an unoptimized validation mode, not a general-purpose terminator solution.
-    /// Changing this setting automatically resets Solari's temporal history.
+    /// A dedicated compute pass recovers each visible triangle with one additional primary
+    /// ray, then writes the vertex-tangent-plane correction to a per-pixel offset texture.
+    /// Primary directional-light shadows and ReSTIR reuse share that texture. Previous-frame
+    /// offsets are retained for temporal reuse; no previous mesh data lookup is needed.
+    /// Recovery rays start at the raster near plane, including for orthographic projections.
+    ///
+    /// Does not change area-light shadows, the G-buffer, BRDF, indirect rays, or world cache.
+    /// Normal-map terminators are not fixed. Raster/raytracing hit mismatches fall back to
+    /// the original origin. This is experimental, not a general-purpose terminator solution.
+    ///
+    /// Enabled views allocate two RGBA32Float textures (32 bytes per internal-resolution
+    /// pixel, about 63 MiB at 1920x1080), plus a history copy each frame. Disabled views
+    /// skip generation and copying and retain only 1x1 bind-compatible placeholders.
+    /// Switching automatically resets Solari history, without recreating the world cache
+    /// or shader pipelines. Spatial and temporal ReSTIR reuse remain available.
     /// Defaults to `false`.
     pub shadow_terminator_fix: bool,
 

@@ -10,6 +10,7 @@ use bevy_core_pipeline::prepass::{
     PreviousViewData, PreviousViewUniformOffset, PreviousViewUniforms, ViewPrepassTextures,
     MOTION_VECTOR_PREPASS_FORMAT,
 };
+use bevy_diagnostic::FrameCount;
 use bevy_ecs::{prelude::*, resource::Resource, system::Commands};
 use bevy_render::{
     diagnostic::RecordDiagnostics as _,
@@ -28,12 +29,15 @@ use bevy_render::{
 };
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_utils::default;
+use core::sync::atomic::Ordering;
 
 /// Resource holding the Solari lighting pipeline configuration.
 #[derive(Resource)]
 pub struct SolariLightingPipelines {
     bind_group_layout: BindGroupLayoutDescriptor,
     bind_group_layout_restir: BindGroupLayoutDescriptor,
+    bind_group_layout_shadow_terminator: BindGroupLayoutDescriptor,
+    shadow_terminator_pipeline: CachedComputePipelineId,
     bind_group_layout_world_cache_active_cells_dispatch: BindGroupLayoutDescriptor,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     bind_group_layout_resolve_dlss_rr_textures: BindGroupLayoutDescriptor,
@@ -91,6 +95,7 @@ pub fn solari_lighting(
     view_uniforms: Res<ViewUniforms>,
     previous_view_uniforms: Res<PreviousViewUniforms>,
     render_device: Res<RenderDevice>,
+    frame_count: Res<FrameCount>,
     mut ctx: RenderContext,
 ) {
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
@@ -200,6 +205,18 @@ pub fn solari_lighting(
         return;
     };
 
+    // Disabled views neither wait for this pipeline nor dispatch the recovery pass.
+    let shadow_terminator_pipeline = if solari_lighting_resources.shadow_terminator_fix {
+        let Some(pipeline) =
+            pipeline_cache.get_compute_pipeline(pipelines.shadow_terminator_pipeline)
+        else {
+            return;
+        };
+        Some(pipeline)
+    } else {
+        None
+    };
+
     // Past every bail-out, so this view's reservoirs will be brought up to this frame's light ids
     if restir.is_some() {
         scene_bindings.note_light_translations_consumed();
@@ -208,22 +225,38 @@ pub fn solari_lighting(
     let view_target_attachment = view_target.get_unsampled_color_attachment();
 
     let s = solari_lighting_resources;
+    let offsets = &s.shadow_terminator_offsets;
     let bind_group = render_device.create_bind_group(
         "solari_lighting_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.bind_group_layout),
-        &BindGroupEntries::sequential((
-            view_target_attachment.view,
-            s.light_tile_samples.as_entire_binding(),
-            s.light_tile_resolved_samples.as_entire_binding(),
-            gbuffer,
-            depth_buffer,
-            motion_vectors,
-            view_uniforms_binding.clone(),
-            previous_view_uniforms_binding.clone(),
-            s.world_cache.as_entire_binding(),
-            s.constants.as_entire_binding(),
+        &BindGroupEntries::with_indices((
+            (0, view_target_attachment.view),
+            (1, s.light_tile_samples.as_entire_binding()),
+            (2, s.light_tile_resolved_samples.as_entire_binding()),
+            (3, gbuffer),
+            (4, depth_buffer),
+            (5, motion_vectors),
+            (6, view_uniforms_binding.clone()),
+            (7, previous_view_uniforms_binding.clone()),
+            (8, s.world_cache.as_entire_binding()),
+            (9, s.constants.as_entire_binding()),
+            (14, &offsets.current.default_view),
+            (15, &offsets.previous.default_view),
         )),
     );
+
+    let bind_group_shadow_terminator = shadow_terminator_pipeline.map(|_| {
+        render_device.create_bind_group(
+            "solari_lighting_bind_group_shadow_terminator",
+            &pipeline_cache.get_bind_group_layout(&pipelines.bind_group_layout_shadow_terminator),
+            &BindGroupEntries::sequential((
+                depth_buffer,
+                view_uniforms_binding.clone(),
+                s.constants.as_entire_binding(),
+                &offsets.current.default_view,
+            )),
+        )
+    });
 
     let bind_group_restir =
         restir.map(|(reservoirs, (previous_gbuffer, previous_depth_buffer))| {
@@ -245,6 +278,8 @@ pub fn solari_lighting(
                     previous_depth_buffer,
                     reservoirs.a.as_entire_binding(),
                     reservoirs.b.as_entire_binding(),
+                    &offsets.current.default_view,
+                    &offsets.previous.default_view,
                 )),
             )
         });
@@ -289,13 +324,31 @@ pub fn solari_lighting(
         });
     }
 
+    let dx = s.view_size.x.div_ceil(8);
+    let dy = s.view_size.y.div_ceil(8);
+
+    // Separate pass: current is storage-write here, sampled read-only by lighting below.
+    // Each enabled pixel performs at most one recovery ray, shared by all reuse queries.
+    if let (Some(pipeline), Some(bind_group)) = (
+        shadow_terminator_pipeline,
+        bind_group_shadow_terminator.as_ref(),
+    ) {
+        let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("solari_lighting_shadow_terminator"),
+            timestamp_writes: None,
+        });
+        let d = diagnostics.time_span(&mut pass, "solari_lighting/shadow_terminator_offsets");
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, scene_bind_group, &[]);
+        pass.set_bind_group(1, bind_group, &[view_uniform_offset.offset]);
+        pass.dispatch_workgroups(dx, dy, 1);
+        d.end(&mut pass);
+    }
+
     let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("solari_lighting"),
         timestamp_writes: None,
     });
-
-    let dx = solari_lighting_resources.view_size.x.div_ceil(8);
-    let dy = solari_lighting_resources.view_size.y.div_ceil(8);
 
     pass.set_bind_group(0, scene_bind_group, &[]);
     pass.set_bind_group(
@@ -386,6 +439,19 @@ pub fn solari_lighting(
 
     drop(pass);
 
+    if s.shadow_terminator_fix {
+        // Copy only after every lighting read (including temporal reverse visibility).
+        // History stays aligned with previous_depth/gbuffer; no previous mesh lookup needed.
+        ctx.command_encoder().copy_texture_to_texture(
+            offsets.current.texture.as_image_copy(),
+            offsets.previous.texture.as_image_copy(),
+            offsets.current.texture.size(),
+        );
+        offsets
+            .last_rendered_frame
+            .store(frame_count.0, Ordering::Relaxed);
+    }
+
     // Active cell count readback.
     diagnostics.record_u32(
         ctx.command_encoder(),
@@ -417,22 +483,57 @@ pub fn init_solari_lighting_pipelines(
 
     let bind_group_layout = BindGroupLayoutDescriptor::new(
         "solari_lighting_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::COMPUTE,
             (
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
-                storage_buffer_sized(false, None),
-                storage_buffer_sized(false, None),
-                texture_2d(TextureSampleType::Uint),
-                texture_depth_2d(),
-                motion_vectors_binding,
-                uniform_buffer::<ViewUniform>(true),
-                uniform_buffer::<PreviousViewData>(true),
-                storage_buffer_sized(false, None),
-                uniform_buffer_sized(false, None),
+                (
+                    0,
+                    texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
+                ),
+                (1, storage_buffer_sized(false, None)),
+                (2, storage_buffer_sized(false, None)),
+                (3, texture_2d(TextureSampleType::Uint)),
+                (4, texture_depth_2d()),
+                (5, motion_vectors_binding),
+                (6, uniform_buffer::<ViewUniform>(true)),
+                (7, uniform_buffer::<PreviousViewData>(true)),
+                (8, storage_buffer_sized(false, None)),
+                (9, uniform_buffer_sized(false, None)),
+                (
+                    14,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
+                (
+                    15,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
             ),
         ),
     );
+
+    let bind_group_layout_shadow_terminator = BindGroupLayoutDescriptor::new(
+        "solari_lighting_bind_group_layout_shadow_terminator",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_depth_2d(),
+                uniform_buffer::<ViewUniform>(true),
+                uniform_buffer_sized(false, None),
+                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+            ),
+        ),
+    );
+    let shadow_terminator_pipeline =
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("solari_lighting_shadow_terminator_offsets_pipeline".into()),
+            layout: vec![
+                scene_bindings.bind_group_layout.clone(),
+                bind_group_layout_shadow_terminator.clone(),
+            ],
+            shader: load_embedded_asset!(asset_server.as_ref(), "shadow_terminator.wesl"),
+            entry_point: Some("generate_shadow_terminator_offsets".into()),
+            ..default()
+        });
 
     let bind_group_layout_restir = BindGroupLayoutDescriptor::new(
         "solari_lighting_bind_group_layout_restir",
@@ -453,6 +554,8 @@ pub fn init_solari_lighting_pipelines(
                 texture_depth_2d(),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
@@ -535,6 +638,8 @@ pub fn init_solari_lighting_pipelines(
     commands.insert_resource(SolariLightingPipelines {
         bind_group_layout: bind_group_layout.clone(),
         bind_group_layout_restir: bind_group_layout_restir.clone(),
+        bind_group_layout_shadow_terminator,
+        shadow_terminator_pipeline,
         bind_group_layout_world_cache_active_cells_dispatch:
             bind_group_layout_world_cache_active_cells_dispatch.clone(),
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
