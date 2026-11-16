@@ -21,7 +21,8 @@ use bevy_ecs::{
     component::Component,
     entity::Entity,
     query::Has,
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectResource},
+    resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query},
 };
@@ -47,7 +48,12 @@ pub struct SolariLightingPlugin;
 
 impl Plugin for SolariLightingPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<SolariLightingSettings>()
+            .register_type::<SolariLightingSettings>()
+            .register_type::<SolariLighting>();
+
         load_shader_library!(app, "gbuffer_utils.wesl");
+        load_shader_library!(app, "shadow_terminator.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "presample_light_tiles.wesl");
         load_shader_library!(app, "initial_path.wesl");
@@ -102,6 +108,38 @@ impl Plugin for SolariLightingPlugin {
     }
 }
 
+/// Application-wide runtime settings installed by [`SolariLightingPlugin`].
+///
+/// Change this resource from an existing UI, an inspector, or any main-world system.
+/// No special scene, keyboard handler, shader reload, or plugin restart is required.
+/// It is also available from [`crate::prelude`]. Resources inserted before the plugin
+/// is added are preserved.
+#[derive(Resource, Reflect, Clone, Copy, Debug, Default)]
+#[reflect(Resource, Default, Clone)]
+pub struct SolariLightingSettings {
+    /// Global override for the experimental shadow terminator correction.
+    ///
+    /// * `None` (default): use each camera's [`SolariLighting::shadow_terminator_fix`].
+    /// * `Some(true)`: enable the correction for all realtime Solari cameras.
+    /// * `Some(false)`: disable it for all realtime Solari cameras.
+    ///
+    /// This override is applied during extraction without modifying camera components.
+    /// Changes take effect on the next extracted frame and reset affected cameras'
+    /// Solari temporal history automatically. See [`SolariLighting::shadow_terminator_fix`]
+    /// for the prototype's directional-light, perspective-camera, and ReSTIR limitations.
+    pub shadow_terminator_fix: Option<bool>,
+}
+
+impl SolariLightingSettings {
+    pub(super) fn apply(&self, lighting: &SolariLighting) -> SolariLighting {
+        let mut effective = lighting.clone();
+        if let Some(enabled) = self.shadow_terminator_fix {
+            effective.shadow_terminator_fix = enabled;
+        }
+        effective
+    }
+}
+
 /// A component for a 3d camera entity to enable the Solari raytraced lighting system.
 ///
 /// Must be used with `CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING)`, and
@@ -123,6 +161,23 @@ pub struct SolariLighting {
     ///
     /// Defaults to `false`.
     pub restir: bool,
+
+    /// Experimental Ray Tracing Gems II chapter 4 shadow terminator correction.
+    ///
+    /// Per-camera setting. [`SolariLightingSettings::shadow_terminator_fix`] can override
+    /// it globally at runtime; `None` on the resource leaves this camera setting in control.
+    ///
+    /// Recovers the primary triangle with an additional camera ray and uses its vertex
+    /// tangent planes to offset primary directional-light shadow rays. Perspective cameras
+    /// only; orthographic views fall back to the original origin. Does not change area-light
+    /// shadows, the G-buffer, BRDF, indirect rays, or world cache. Normal-map terminators
+    /// are not fixed. Raster/raytracing hit mismatches fall back to the original origin.
+    /// While enabled, ReSTIR retains spatial reuse but disables temporal reuse, since previous
+    /// triangle data is not retained. Spatial reuse may perform extra recovery rays.
+    /// This is an unoptimized validation mode, not a general-purpose terminator solution.
+    /// Changing this setting automatically resets Solari's temporal history.
+    /// Defaults to `false`.
+    pub shadow_terminator_fix: bool,
 
     /// Maximum confidence weight (effective temporal history length) a pixel
     /// can accumulate during temporal resampling.
@@ -221,6 +276,7 @@ impl Default for SolariLighting {
     fn default() -> Self {
         Self {
             restir: false,
+            shadow_terminator_fix: false,
             confidence_weight_cap: 8.0,
             primary_di_samples: 8,
             secondary_di_samples: 4,
@@ -261,6 +317,39 @@ fn manage_prepass_double_buffers(
             }
             if depth_double_buffered {
                 entity.remove::<DepthPrepassDoubleBuffer>();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_reflect::TypeRegistry;
+
+    #[test]
+    fn runtime_settings_are_reflected_for_inspectors() {
+        let mut registry = TypeRegistry::default();
+        registry.register::<SolariLightingSettings>();
+        let registration = registry
+            .get(core::any::TypeId::of::<SolariLightingSettings>())
+            .unwrap();
+        assert!(registration.data::<ReflectResource>().is_some());
+        assert!(registration.data::<ReflectComponent>().is_some());
+    }
+
+    #[test]
+    fn global_override_preserves_per_camera_choice() {
+        let mut camera = SolariLighting::default();
+        for local in [false, true] {
+            camera.shadow_terminator_fix = local;
+            for global in [None, Some(false), Some(true)] {
+                let settings = SolariLightingSettings {
+                    shadow_terminator_fix: global,
+                };
+                let effective = settings.apply(&camera);
+                assert_eq!(effective.shadow_terminator_fix, global.unwrap_or(local));
+                assert_eq!(camera.shadow_terminator_fix, local);
             }
         }
     }

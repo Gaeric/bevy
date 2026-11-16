@@ -75,6 +75,8 @@ struct SolariLightingUniforms {
     world_cache_position_lod_scale: f32,
     frame_rng: u32,
     reset: u32,
+    shadow_terminator_fix: u32,
+    _padding: [u32; 3],
 }
 
 impl SolariLightingUniforms {
@@ -92,6 +94,8 @@ impl SolariLightingUniforms {
             world_cache_position_lod_scale: settings.world_cache_position_lod_scale,
             frame_rng: frame_count.wrapping_mul(5782582),
             reset: (settings.reset || force_reset) as u32,
+            shadow_terminator_fix: settings.shadow_terminator_fix as u32,
+            _padding: [0; 3],
         }
     }
 }
@@ -120,6 +124,7 @@ pub struct SolariLightingResources {
     pub world_cache: Buffer,
     pub world_cache_active_cells_dispatch: Buffer,
     pub view_size: UVec2,
+    pub shadow_terminator_fix: bool,
 }
 
 pub struct SolariReservoirBuffers {
@@ -128,18 +133,18 @@ pub struct SolariReservoirBuffers {
 }
 
 pub fn prepare_solari_lighting_resources(
-    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))] query: Query<(
+    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))] mut query: Query<(
         Entity,
         &ExtractedCamera,
         &SolariLighting,
-        Option<&SolariLightingResources>,
+        Option<&mut SolariLightingResources>,
         Option<&MainPassResolutionOverride>,
     )>,
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] query: Query<(
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] mut query: Query<(
         Entity,
         &ExtractedCamera,
         &SolariLighting,
-        Option<&SolariLightingResources>,
+        Option<&mut SolariLightingResources>,
         Option<&MainPassResolutionOverride>,
         Has<Dlss<DlssRayReconstructionFeature>>,
     )>,
@@ -148,7 +153,7 @@ pub fn prepare_solari_lighting_resources(
     frame_count: Res<FrameCount>,
     mut commands: Commands,
 ) {
-    for query_item in &query {
+    for query_item in &mut query {
         #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
         let (entity, camera, solari_lighting, solari_lighting_resources, resolution_override) =
             query_item;
@@ -172,10 +177,17 @@ pub fn prepare_solari_lighting_resources(
         let reusable = solari_lighting_resources.filter(|r| {
             r.view_size == view_size && r.reservoirs.is_some() == solari_lighting.restir
         });
-        let uniforms =
-            SolariLightingUniforms::new(solari_lighting, frame_count.0, reusable.is_none());
+        let mode_changed = reusable
+            .as_ref()
+            .is_some_and(|r| r.shadow_terminator_fix != solari_lighting.shadow_terminator_fix);
+        let uniforms = SolariLightingUniforms::new(
+            solari_lighting,
+            frame_count.0,
+            reusable.is_none() || mode_changed,
+        );
 
-        if let Some(solari_lighting_resources) = reusable {
+        if let Some(mut solari_lighting_resources) = reusable {
+            solari_lighting_resources.shadow_terminator_fix = solari_lighting.shadow_terminator_fix;
             // The constants uniform can change every frame, so always upload it.
             render_queue.write_buffer(
                 &solari_lighting_resources.constants,
@@ -244,6 +256,7 @@ pub fn prepare_solari_lighting_resources(
             world_cache,
             world_cache_active_cells_dispatch,
             view_size,
+            shadow_terminator_fix: solari_lighting.shadow_terminator_fix,
         });
 
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -336,5 +349,30 @@ pub fn prepare_solari_lighting_resources(
                     },
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_terminator_uniform_layout_and_defaults() {
+        // Matches sixteen scalar fields in realtime/bindings.wesl (64 bytes).
+        assert_eq!(size_of::<SolariLightingUniforms>(), 64);
+        assert_eq!(
+            core::mem::offset_of!(SolariLightingUniforms, shadow_terminator_fix),
+            48
+        );
+        let mut settings = SolariLighting::default();
+        settings.reset = false;
+        let uniforms = SolariLightingUniforms::new(&settings, 0, false);
+        assert_eq!(uniforms.shadow_terminator_fix, 0);
+        assert_eq!(uniforms.reset, 0);
+        settings.shadow_terminator_fix = true;
+        let uniforms = SolariLightingUniforms::new(&settings, 0, true);
+        assert_eq!(uniforms.shadow_terminator_fix, 1);
+        assert_eq!(uniforms.reset, 1);
+        assert_eq!(uniforms._padding, [0; 3]);
     }
 }

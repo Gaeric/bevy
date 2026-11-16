@@ -1,3 +1,4 @@
+import package::realtime::shadow_terminator::primary_shadow_terminator_offset;
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_range_u};
 import bevy_render::maths::PI;
@@ -34,6 +35,7 @@ struct InitialSamplingResult {
 /// surface), x2 = first BRDF-sampled hit (the reconnection vertex).
 struct PathState {
     ray_origin: vec3<f32>,
+    shadow_ray_origin: vec3<f32>,
     normal: vec3<f32>,
     wo: vec3<f32>,
     material: ResolvedMaterial,
@@ -57,6 +59,7 @@ struct PathState {
 fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial) -> PathState {
     var path: PathState;
     path.ray_origin = world_position + (world_normal * RAY_T_MIN);
+    path.shadow_ray_origin = path.ray_origin + primary_shadow_terminator_offset(world_position, view.world_position);
     path.normal = world_normal;
     path.wo = wo;
     path.material = material;
@@ -175,6 +178,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
 
         // Advance to the next vertex
         path.ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
+        path.shadow_ray_origin = path.ray_origin;
         path.normal = ray_hit.world_normal;
         path.wo = -next_bounce.wi;
         path.material = ray_hit.material;
@@ -216,7 +220,7 @@ fn generate_nee_candidate(
 ) {
     if rand_f(rng) >= p_nee { return; }
 
-    let di = sample_light_ris((*path).ray_origin, (*path).normal, (*path).wo, (*path).material, F_ab, di_samples, workgroup_id, bounce, rng);
+    let di = sample_light_ris((*path).ray_origin, (*path).shadow_ray_origin, (*path).normal, (*path).wo, (*path).material, F_ab, di_samples, workgroup_id, bounce, rng);
     let di_target_function = luminance(di.brdf_radiance);
     if di_target_function <= 0.0 { return; }
 
@@ -265,7 +269,7 @@ struct DiSample {
     brdf_rays_can_hit: bool,
 }
 
-fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, di_samples: u32, workgroup_id: vec2<u32>, bounce: u32, rng: ptr<function, u32>) -> DiSample {
+fn sample_light_ris(ray_origin: vec3<f32>, shadow_ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, di_samples: u32, workgroup_id: vec2<u32>, bounce: u32, rng: ptr<function, u32>) -> DiSample {
     var workgroup_rng = (workgroup_id.x * 5782582u) + workgroup_id.y + bounce;
     let light_tile_start = rand_range_u(128u, &workgroup_rng) * 1024u;
 
@@ -304,7 +308,10 @@ fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, mat
     var unbiased_contribution_weight = 0.0;
     if selected_target_function > 0.0 {
         unbiased_contribution_weight = weight_sum / selected_target_function;
-        unbiased_contribution_weight *= trace_visibility(ray_origin, selected_world_position);
+        // Limit this experiment to directional NEE. Moving only NEE origins for area lights
+        // would make its visibility inconsistent with the competing BRDF-emissive MIS path.
+        let visibility_origin = select(ray_origin, shadow_ray_origin, selected_world_position.w == 0.0);
+        unbiased_contribution_weight *= trace_visibility(visibility_origin, selected_world_position);
     }
 
     return DiSample(unbiased_contribution_weight, light_tile_samples[selected_tile_sample], selected_wi, selected_brdf_radiance, selected_inverse_solid_angle_pdf, selected_brdf_rays_can_hit);

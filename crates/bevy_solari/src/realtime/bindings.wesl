@@ -55,6 +55,10 @@ struct SolariLightingSettings {
     world_cache_position_lod_scale: f32,
     frame_rng: u32,
     reset: u32,
+    shadow_terminator_fix: u32,
+    _padding_a: u32,
+    _padding_b: u32,
+    _padding_c: u32,
 }
 
 /// Don't adjust the size of this struct without also adjusting `prepare::RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE`.

@@ -1,5 +1,6 @@
 //! https://intro-to-restir.cwyman.org/presentations/2023ReSTIR_Course_Notes.pdf
 
+import package::realtime::shadow_terminator::primary_shadow_terminator_offset;
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
 import bevy_render::utils::octahedral_decode;
@@ -73,7 +74,9 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 
 fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<f32>, world_normal: vec3<f32>) -> NeighborInfo {
-    if bool(constants.reset) {
+    // Previous TLAS hits cannot safely index current geometry after instance-slot reuse.
+    // Until primary offsets have a history buffer, keep spatial reuse but disable temporal reuse.
+    if bool(constants.reset) || constants.shadow_terminator_fix != 0u {
         return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
     }
 
@@ -247,14 +250,25 @@ fn merge_reservoirs(
 
     // Visibility for the cross-domain targets
     if other_sample_at_canonical.target_function > 0.0 && other_sample_at_canonical_jacobian > 0.0 {
-        let visibility = trace_visibility(canonical_world_position + canonical_world_normal * RAY_T_MIN, other_sample_at_canonical.sample_world_position);
+        var shadow_origin = canonical_world_position + canonical_world_normal * RAY_T_MIN;
+        // Match primary NEE generation. Indirect reconnections retain their original origin.
+        if other_reservoir.light_sample.light_id != NULL_LIGHT_ID && other_resolved.world_position.w == 0.0 {
+            shadow_origin += primary_shadow_terminator_offset(canonical_world_position, view.world_position);
+        }
+        let visibility = trace_visibility(shadow_origin, other_sample_at_canonical.sample_world_position);
         other_sample_at_canonical.target_function *= visibility;
     }
     if canonical_sample_at_other.target_function > 0.0 && canonical_sample_at_other_jacobian > 0.0 {
+        var shadow_origin = other_world_position + other_world_normal * RAY_T_MIN;
+        @if(SPATIAL_MERGE) {
+            if canonical_reservoir.light_sample.light_id != NULL_LIGHT_ID && canonical_resolved.world_position.w == 0.0 {
+                shadow_origin += primary_shadow_terminator_offset(other_world_position, other_view_position);
+            }
+        }
         @if(SPATIAL_MERGE)
-        let visibility = trace_visibility(other_world_position + other_world_normal * RAY_T_MIN, canonical_sample_at_other.sample_world_position);
+        let visibility = trace_visibility(shadow_origin, canonical_sample_at_other.sample_world_position);
         @else
-        let visibility = trace_visibility_previous_frame(other_world_position + other_world_normal * RAY_T_MIN, canonical_sample_at_other.sample_world_position);
+        let visibility = trace_visibility_previous_frame(shadow_origin, canonical_sample_at_other.sample_world_position);
         canonical_sample_at_other.target_function *= visibility;
     }
 
